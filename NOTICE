@@ -1,0 +1,16 @@
+KER Exoskeleton Replica
+Copyright 2026 keelo12345
+
+This project includes firmware derived from or inspired by Enactic, Inc.'s
+openarm_ker_firmware (https://docs.openarm.dev/), licensed under the
+Apache License, Version 2.0.
+
+The encoder firmware in firmware/encoder/ originates from that project;
+original copyright headers and the Apache 2.0 license (LICENSE.txt) are
+retained. main.cpp.test is a modified version of the original firmware.
+main.cpp.benchdiag is a new diagnostic firmware written for the same
+hardware, reusing the original pin assignments and TLE5012B SSC access
+sequence.
+
+Structural CAD files in cad/ are re-designed parts based on the OpenArm
+KER open-source hardware design.

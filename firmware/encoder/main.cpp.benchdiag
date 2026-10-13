@@ -1,0 +1,253 @@
+// KER encoder board BENCH DIAGNOSTIC firmware
+//
+// Purpose: isolate faults among MCU / RS485 transceiver / TLE5012B sensor
+// using only a PC + USB-RS485 dongle. Runs at 115200 baud (CP210x-safe),
+// ASCII commands, half-duplex.
+//
+// Commands (single byte):
+//   'L' -> "OK <millis>"          link round-trip (MCU + RS485 both ways)
+//   'I' -> "BENCHDIAG v2 id=<id>" firmware identity
+//   'P' -> "PIN CS=H CLK=L DATA=H" idle pin levels (DATA stuck/pull state)
+//   'A' -> "A 0x<raw15> <centideg>" single AVAL read
+//   'T' -> "T 0x<stat> 0x<aval>"   TLE5012B STAT + AVAL registers
+//   'S' -> stream "S 0x<raw15> <centideg>" every 100ms, auto-stop after 10s
+//          (rotate the magnet above the chip during the stream)
+//   'K' / 'C' / 'D' -> pin-drive toggle test (v2): CLK / CS / DATA driven as
+//          a 0.5 Hz square wave for 20 s, any other byte stops it.
+//          Probe the pin with a multimeter: follows the wave -> MCU driver
+//          and trace OK; stuck -> MCU pin dead or trace/solder broken.
+// Any other byte stops streaming or toggling.
+// LED: lit 100ms after every received byte (visible link indicator).
+
+#include <Arduino.h>
+#include <stdio.h>
+
+// #define DEVICE_ID 10  (set via -DDEVICE_ID in platformio.ini)
+
+#define CLK  16
+#define DATA_PIN 14
+#define CS   13
+
+#define LED 9
+
+#define TX 7
+#define RX 6
+#define EN 5
+
+#define SERIAL_BAUD 115200UL
+
+#ifndef DEVICE_ID
+#define DEVICE_ID 10
+#endif
+
+#ifndef digitalWriteFast
+  #define digitalWriteFast(pin, val) digitalWrite((pin), (val))
+#endif
+#ifndef digitalReadFast
+  #define digitalReadFast(pin) digitalRead((pin))
+#endif
+#ifndef pinModeFast
+  #define pinModeFast(pin, mode) pinMode((pin), (mode))
+#endif
+
+static const uint16_t CMD_READ_AVAL = 0x8021;  // AVAL @0x02, 1 word
+static const uint16_t CMD_READ_STAT = 0x8001; // STAT @0x00, 1 word
+
+static inline void clkLow()  { digitalWriteFast(CLK, LOW); }
+static inline void clkHigh() { digitalWriteFast(CLK, HIGH); }
+static inline void csLow()   { digitalWriteFast(CS, LOW); }
+static inline void csHigh()  { digitalWriteFast(CS, HIGH); }
+
+static inline void dataOut() { pinModeFast(DATA_PIN, OUTPUT); }
+static inline void dataIn()  { pinModeFast(DATA_PIN, INPUT); }
+static inline void dataWrite(uint8_t v) { digitalWriteFast(DATA_PIN, v ? HIGH : LOW); }
+static inline uint8_t dataRead() { return digitalReadFast(DATA_PIN) ? 1 : 0; }
+
+static inline void sscWrite16(uint16_t v) {
+  dataOut();
+  for (int8_t i = 15; i >= 0; --i) {
+    dataWrite((v >> i) & 0x01);
+    clkHigh();
+    clkLow();
+  }
+}
+
+static inline uint16_t sscRead16() {
+  dataIn();
+  uint16_t v = 0;
+  for (int8_t i = 15; i >= 0; --i) {
+    v <<= 1;
+    clkHigh();
+    clkLow();
+    v |= dataRead();
+  }
+  return v;
+}
+
+static inline uint16_t sscReadRegister(uint16_t sscCmd) {
+  csLow();
+  sscWrite16(sscCmd);
+  dataIn();
+  uint16_t raw = sscRead16();
+  csHigh();
+  return raw;
+}
+
+static inline int16_t signExtend15(uint16_t raw) {
+  uint16_t v15 = raw & 0x7FFF;
+  if (v15 & 0x4000) return (int16_t)(v15 | 0x8000);
+  return (int16_t)v15;
+}
+
+static uint32_t last_rx_ms = 0;
+static bool streaming = false;
+static uint32_t last_stream_ms = 0;
+static uint32_t stream_started_ms = 0;
+
+// Pin-drive toggle test (v2)
+enum Toggle : uint8_t { TG_NONE, TG_CLK, TG_CS, TG_DATA };
+static uint8_t toggle_test = TG_NONE;
+static uint32_t toggle_started_ms = 0;
+
+void stopToggle() {
+  if (toggle_test == TG_NONE) return;
+  // restore idle states: CLK low, CS high, DATA input
+  pinModeFast(DATA_PIN, INPUT);
+  digitalWriteFast(CLK, LOW);
+  digitalWriteFast(CS, HIGH);
+  toggle_test = TG_NONE;
+}
+
+void reply(const char* s) {
+  digitalWrite(EN, HIGH);
+  delayMicroseconds(200);          // let dongle TX->RX turnaround settle
+  Serial.print(s);
+  Serial.flush();
+  digitalWrite(EN, LOW);
+}
+
+void printAngleLine(char tag) {
+  uint16_t raw = sscReadRegister(CMD_READ_AVAL);
+  int16_t aval = signExtend15(raw);
+  int32_t centideg = (int32_t)aval * 36000L / 32768L;
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%c 0x%04X %ld\n", tag, raw & 0x7FFF, (long)centideg);
+  reply(buf);
+}
+
+void setup() {
+  pinModeFast(CS, OUTPUT);
+  pinModeFast(CLK, OUTPUT);
+  pinModeFast(DATA_PIN, INPUT);
+
+  pinMode(LED, OUTPUT);
+  digitalWrite(LED, LOW);
+
+  pinMode(EN, OUTPUT);
+  digitalWrite(EN, LOW);  // receive mode
+
+  Serial.begin(SERIAL_BAUD);
+
+  csHigh();
+  clkLow();
+
+  reply("BENCHDIAG v1\n");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    uint8_t c = (uint8_t)Serial.read();
+    last_rx_ms = millis();
+    streaming = false;
+    stopToggle();
+
+    switch (c) {
+      case 'L': {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "OK %lu\n", (unsigned long)millis());
+        reply(buf);
+        break;
+      }
+      case 'I': {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "BENCHDIAG v2 id=%u\n", (unsigned)DEVICE_ID);
+        reply(buf);
+        break;
+      }
+      case 'K':
+        stopToggle();
+        toggle_test = TG_CLK;
+        toggle_started_ms = millis();
+        reply("CLK TOGGLE 20s\n");
+        break;
+      case 'C':
+        stopToggle();
+        toggle_test = TG_CS;
+        toggle_started_ms = millis();
+        reply("CS TOGGLE 20s\n");
+        break;
+      case 'D':
+        stopToggle();
+        toggle_test = TG_DATA;
+        toggle_started_ms = millis();
+        reply("DATA TOGGLE 20s\n");
+        break;
+      case 'P': {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "PIN CS=%c CLK=%c DATA=%c\n",
+                 digitalReadFast(CS) ? 'H' : 'L',
+                 digitalReadFast(CLK) ? 'H' : 'L',
+                 dataRead() ? 'H' : 'L');
+        reply(buf);
+        break;
+      }
+      case 'A':
+        printAngleLine('A');
+        break;
+      case 'T': {
+        uint16_t stat = sscReadRegister(CMD_READ_STAT);
+        uint16_t aval = sscReadRegister(CMD_READ_AVAL);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "T 0x%04X 0x%04X\n", stat, aval & 0x7FFF);
+        reply(buf);
+        break;
+      }
+      case 'S':
+        streaming = true;
+        stream_started_ms = millis();
+        last_stream_ms = 0;
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (streaming) {
+    uint32_t now = millis();
+    if (now - stream_started_ms > 10000UL) streaming = false;  // auto-stop
+    if (now - last_stream_ms >= 100) {
+      last_stream_ms = now;
+      printAngleLine('S');
+    }
+  }
+
+  if (toggle_test != TG_NONE) {
+    uint32_t now = millis();
+    if (now - toggle_started_ms > 20000UL) {
+      stopToggle();
+    } else {
+      bool phase = ((now - toggle_started_ms) / 1000UL) & 1;  // 0.5 Hz square
+      switch (toggle_test) {
+        case TG_CLK:  digitalWriteFast(CLK, phase); break;
+        case TG_CS:   digitalWriteFast(CS, phase); break;
+        case TG_DATA:
+          pinModeFast(DATA_PIN, OUTPUT);
+          digitalWriteFast(DATA_PIN, phase);
+          break;
+        default: break;
+      }
+    }
+  }
+
+  digitalWrite(LED, (millis() - last_rx_ms) < 100 ? HIGH : LOW);
+}

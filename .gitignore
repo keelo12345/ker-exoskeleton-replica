@@ -1,0 +1,11 @@
+# PlatformIO build artifacts
+.pio/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+Thumbs.db
+.DS_Store
